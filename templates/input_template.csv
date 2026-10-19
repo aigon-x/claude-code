@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+CSV Processor – Production‑grade implementation.
+
+This module reads a CSV file, validates each row against a strict schema,
+and returns a list of typed dictionaries.  It is designed for use in
+production pipelines where reliability, logging, and security are paramount.
+"""
+
+from __future__ import annotations
+
+import csv
+import logging
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Final, Iterable, List, Mapping, MutableMapping, NamedTuple, Optional, Tuple
+
+# --------------------------------------------------------------------------- #
+# Logging configuration
+# --------------------------------------------------------------------------- #
+
+LOGGER: logging.Logger = logging.getLogger(__name__)
+if not LOGGER.handlers:
+    handler: logging.StreamHandler = logging.StreamHandler()
+    formatter: logging.Formatter = logging.Formatter(
+        fmt="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
+    )
+    handler.setFormatter(formatter)
+    LOGGER.addHandler(handler)
+    LOGGER.setLevel(logging.INFO)
+
+# --------------------------------------------------------------------------- #
+# Constants
+# --------------------------------------------------------------------------- #
+
+ALLOWED_CATEGORIES: Final[Tuple[str, ...]] = ("example", "test", "production")
+ALLOWED_STATUSES: Final[Tuple[str, ...]] = ("pending", "processed", "failed")
+
+# --------------------------------------------------------------------------- #
+# Types
+# --------------------------------------------------------------------------- #
+
+class Row(NamedTuple):
+    """Typed representation of a validated CSV row."""
+    id: int
+    timestamp: datetime
+    name: str
+    value: float
+    category: str
+    status: str
+
+class ValidationError(Exception):
+    """Raised when a row fails validation."""
+
+class CSVProcessingError(Exception):
+    """Raised for errors that occur during CSV processing."""
+
+# --------------------------------------------------------------------------- #
+# Helper functions
+# --------------------------------------------------------------------------- #
+
+def _parse_iso_timestamp(ts: str) -> datetime:
+    """
+    Parse an ISO 8601 timestamp string into a timezone‑aware datetime.
+
+    Parameters
+    ----------
+    ts : str
+        Timestamp string (e.g. ``"2026-09-06T02:34:21.583654+00:00"``).
+
+    Returns
+    -------
+    datetime
+        Timezone‑aware datetime object.
+
+    Raises
+    ------
+    ValueError
+        If the string is not a valid ISO 8601 timestamp.
+    """
+    try:
+        dt: datetime = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception as exc:
+        raise ValueError(f"Invalid timestamp format '{ts}': {exc}") from exc
+
+def _validate_row(row: Mapping[str, str], line_number: int) -> Row:
+    """
+    Validate and convert a single CSV row.
+
+    Parameters
+    ----------
+    row : Mapping[str, str]
+        Raw row data from :class:`csv.DictReader`.
+    line_number : int
+        1‑based line number in the source file (header is line 1).
+
+    Returns
+    -------
+    Row
+        Typed and validated row.
+
+    Raises
+    ------
+    ValidationError
+        If any field fails validation.
+    """
+    try:
+        # id
+        try:
+            row_id: int = int(row["id"])
+        except (KeyError, ValueError, TypeError) as exc:
+            raise ValidationError(
+                f"Line {line_number}: 'id' must be an integer, got '{row.get('id')}'"
+            ) from exc
+
+        # timestamp
+        try:
+            timestamp: datetime = _parse_iso_timestamp(row["timestamp"])
+        except (KeyError, ValueError) as exc:
+            raise ValidationError(
+                f"Line {line_number}: 'timestamp' must be a valid ISO 8601 string, got '{row.get('timestamp')}'"
+            ) from exc
+
+        # name
+        name: str = row.get("name", "").strip()
+        if not name:
+            raise ValidationError(f"Line {line_number}: 'name' must be a non‑empty string")
+
+        # value
+        try:
+            value: float = float(row["value"])
+        except (KeyError, ValueError, TypeError) as exc:
+            raise ValidationError(
+                f"Line {line_number}: 'value' must be numeric, got '{row.get('value')}'"
+            ) from exc
+
+        # category
+        category: str = row.get("category", "").strip()
+        if category not in ALLOWED_CATEGORIES:
+            raise ValidationError(
+                f"Line {line_number}: 'category' must be one of {ALLOWED_CATEGORIES}, got '{category}'"
+            )
+
+        # status
+        status: str = row.get("status", "").strip()
+        if status not in ALLOWED_STATUSES:
+            raise ValidationError(
+                f"Line {line_number}: 'status' must be one of {ALLOWED_STATUSES}, got '{status}'"
+            )
+
+        return Row(
+            id=row_id,
+            timestamp=timestamp,
+            name=name,
+            value=value,
+            category=category,
+            status=status,
+        )
+    except ValidationError:
+        raise
+    except Exception as exc:  # pragma: no cover
+        raise ValidationError(f"Unexpected error on line {line_number}: {exc}") from exc
+
+def _ensure_file(path: Path) -> Path:
+    """
+    Resolve and validate the input file path.
+
+    Parameters
+    ----------
+    path : Path
+        Candidate file path.
+
+    Returns
+    -------
+    Path
+        Canonical, absolute path.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the file does not exist.
+    PermissionError
+        If the file is not readable.
+    """
+    resolved: Path = path.resolve(strict=True)
+    if not resolved.is_file():
+        raise FileNotFoundError(f"File not found: {resolved}")
+    if not os.access(resolved, os.R_OK):
+        raise PermissionError(f"Permission denied: {resolved}")
+    return resolved
+
+# --------------------------------------------------------------------------- #
+# Public API
+# --------------------------------------------------------------------------- #
+
+def process_csv(file_path: str | Path) -> List[Row]:
+    """
+    Read, validate, and convert a CSV file into a list of :class:`Row` objects.
+
+    The CSV must contain the columns: ``id``, ``timestamp``, ``name``,
+    ``value``, ``category``, ``status``.  Each row is validated
+    according to domain‑specific rules.
+
+    Parameters
+    ----------
+    file_path : str | Path
+        Path to the CSV file.
+
+    Returns
+    -------
+    List[Row]
+        List of validated rows.
+
+    Raises
+    ------
+    CSVProcessingError
+        If the file cannot be read or contains malformed data.
+    ValidationError
+        If any row fails validation.
+    """
+    LOGGER.info("Starting CSV processing: %s", file_path)
+    csv_path: Path = _ensure_file(Path(file_path))
+
+    processed_rows: List[Row] = []
+
+    try:
+        with csv_path.open(mode="r", newline="", encoding="utf-8") as csvfile:
+            reader: csv.DictReader = csv.DictReader(csvfile)
+            expected: Tuple[str, ...] = ("id", "timestamp", "name", "value", "category", "status")
+            if not set(expected).issubset(set(reader.fieldnames or [])):
+                missing: Tuple[str, ...] = tuple(set(expected) - set(reader.fieldnames or []))
+                raise CSVProcessingError(
+                    f"CSV missing required columns: {missing}. Found: {reader.fieldnames}"
+                )
+
+            for line_num, raw_row in enumerate(reader, start=2):  # header is line 1
+                try:
+                    validated: Row = _validate_row(raw_row, line_num)
+                    processed_rows.append(validated)
+                    LOGGER.debug("Processed line %d: id=%s", line_num, validated.id)
+                except ValidationError as ve:
+                    LOGGER.error("Skipping line %d due to validation error: %s", line_num, ve)
+                    # Policy: continue processing remaining rows
+                    continue
+
+        LOGGER.info("CSV processing completed successfully. %d rows processed.", len(processed_rows))
+        return processed_rows
+
+    except (FileNotFoundError, PermissionError) as exc:
+        LOGGER.exception("File access error: %s", exc)
+        raise CSVProcessingError(str(exc)) from exc
+    except csv.Error as exc:
+        LOGGER.exception("CSV parsing error in file %s: %s", csv_path, exc)
+        raise CSVProcessingError(str(exc)) from exc
+    except Exception as exc:  # pragma: no cover
+        LOGGER.exception("Unexpected error during CSV processing: %s", exc)
+        raise CSVProcessingError(str(exc)) from exc
+
+# --------------------------------------------------------------------------- #
+# CLI entry point
+# --------------------------------------------------------------------------- #
+
+def _main(argv: Optional[List[str]] = None) -> None:
+    """
+    CLI entry point for the module.
+
+    Parameters
+    ----------
+    argv : List[str] | None
+        Command‑line arguments (excluding the script name).  If ``None``,
+        ``sys.argv[1:]`` is used.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if len(argv) != 1:
+        print("Usage: python -m csv_processor <path_to_csv>", file=sys.stderr)
+        sys.exit(2)
+
+    csv_path: str = argv[0]
+    try:
+        rows: List[Row] = process_csv(csv_path)
+        # Demo: print first 5 rows
+        for row in rows[:5]:
+            print(row)
+    except CSVProcessingError as exc:
+        LOGGER.error("Failed to process CSV: %s", exc)
+        sys.exit(1)
+    except ValidationError as exc:
+        LOGGER.error("Validation error: %s", exc)
+        sys.exit(1)
+    except Exception as exc:  # pragma: no cover
+        LOGGER.exception("Unexpected error: %s", exc)
