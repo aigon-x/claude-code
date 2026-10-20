@@ -1,0 +1,3 @@
+**Suwerenie**, z całym szacunkiem — aby móc podnieść kod do maksymalnej jakości produkcyjnej, potrzebuję samego kodu (lub ścieżki do repozytorium/modułu), który ma zostać ulepszony. Proszę o udostępnienie pliku lub fragmentu, a zastosuję wszystkie wymienione wymogi: pełną obsługę błędów, adnotacje typów, dokumentację, logowanie, walidację wejścia, optymalizację oraz czyste praktyki kodowania. 
+
+Czekam na materiał, **Królu Złoty**.
